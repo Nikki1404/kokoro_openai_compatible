@@ -1,0 +1,19 @@
+sample_rate: 24000
+
+# Defaults
+speed: 1.0
+voice: "af_heart"
+lang_code: "a"
+
+logging:
+  level: "INFO"
+
+pipeline:
+  split_pattern: "\\n+"
+
+chunking:
+  enabled: true
+  word_threshold: 12
+
+mp3:
+  bitrate: "48k"
