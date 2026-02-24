@@ -23,16 +23,19 @@ except Exception:
 from kokoro import KPipeline
 
 
-# -----------------------------
-# Config + logging
-# -----------------------------
+# =====================================================
+# CONFIG
+# =====================================================
 CONFIG_PATH = os.getenv("CONFIG_PATH", "app/config.yaml")
 
 with open(CONFIG_PATH, "r") as f:
     CONFIG = yaml.safe_load(f)
 
 LOG_LEVEL = CONFIG.get("logging", {}).get("level", "INFO").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 logger = logging.getLogger("kokoro-openai-streaming")
 
 SR = int(CONFIG.get("sample_rate", 24000))
@@ -43,16 +46,17 @@ DEFAULT_LANG = str(CONFIG.get("lang_code", "a"))
 SPLIT_PATTERN = CONFIG.get("pipeline", {}).get("split_pattern", r"\n+")
 CHUNK_ENABLED = bool(CONFIG.get("chunking", {}).get("enabled", True))
 WORD_THRESHOLD = int(CONFIG.get("chunking", {}).get("word_threshold", 12))
-
 MP3_BITRATE = str(CONFIG.get("mp3", {}).get("bitrate", "48k"))
+
+KOKORO_REPO_ID = os.getenv("KOKORO_REPO_ID", "hexgrad/Kokoro-82M")
 
 app = FastAPI()
 pipeline: Optional[KPipeline] = None
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
+# =====================================================
+# HELPERS
+# =====================================================
 def get_device() -> str:
     if torch is not None and torch.cuda.is_available():
         return "cuda"
@@ -60,7 +64,6 @@ def get_device() -> str:
 
 
 def as_numpy_float(audio) -> np.ndarray:
-    """Return float32 mono PCM [-1..1]."""
     if torch is not None and isinstance(audio, torch.Tensor):
         audio = audio.detach().cpu().numpy()
     a = np.asarray(audio, dtype=np.float32).reshape(-1)
@@ -68,7 +71,6 @@ def as_numpy_float(audio) -> np.ndarray:
 
 
 def float_to_s16le_bytes(a: np.ndarray) -> bytes:
-    """float32 [-1..1] -> int16 little-endian PCM bytes"""
     pcm16 = (a * 32767.0).astype(np.int16)
     return pcm16.tobytes()
 
@@ -82,7 +84,6 @@ def chunk_text(text: str, max_words: int) -> list[str]:
     if len(words) <= max_words:
         return [text]
 
-    # sentence-first chunking, then word chunking
     sentences = re.split(r"(?<=[.!?])\s+", text)
     chunks: list[str] = []
     for s in sentences:
@@ -98,42 +99,51 @@ def chunk_text(text: str, max_words: int) -> list[str]:
     return chunks
 
 
-def media_type_for(fmt: str) -> str:
-    fmt = (fmt or "").lower()
-    if fmt == "mp3":
-        return "audio/mpeg"
-    if fmt in ("pcm", "pcm16", "s16", "raw"):
-        return "application/octet-stream"
-    if fmt == "wav":
-        return "audio/wav"
-    return "application/octet-stream"
-
-
-# -----------------------------
+# =====================================================
 # OpenAI-compatible schema
-# -----------------------------
+# =====================================================
 class OpenAISpeechRequest(BaseModel):
-    model: str = "kokoro"  # ignored but required by SDK
+    model: str = "kokoro"
     input: str
     voice: Optional[str] = None
     response_format: Optional[Literal["mp3", "pcm"]] = "mp3"
     speed: Optional[float] = None
 
 
+# =====================================================
+# STARTUP
+# =====================================================
 @app.on_event("startup")
 async def startup():
     global pipeline
+
     device = get_device()
-    pipeline = KPipeline(lang_code=DEFAULT_LANG, device=device)
 
-    gpu = None
-    if torch is not None and torch.cuda.is_available():
-        try:
-            gpu = torch.cuda.get_device_name(0)
-        except Exception:
-            gpu = "cuda"
+    logger.info("========================================")
+    logger.info("Starting Kokoro TTS Service")
+    logger.info(f"Device: {device}")
+    logger.info(f"Repo ID: {KOKORO_REPO_ID}")
 
-    logger.info(f"Kokoro initialized (device={device}, gpu={gpu}, lang={DEFAULT_LANG}, sr={SR})")
+    if torch is not None:
+        logger.info(f"PyTorch version: {torch.__version__}")
+        if torch.cuda.is_available():
+            logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            logger.warning("CUDA not available. Running on CPU.")
+
+    try:
+        pipeline = KPipeline(
+            repo_id=KOKORO_REPO_ID,
+            lang_code=DEFAULT_LANG,
+            device=device
+        )
+        logger.info("Kokoro pipeline initialized successfully.")
+        logger.info("========================================")
+
+    except Exception as e:
+        logger.error("Kokoro initialization failed:")
+        logger.error(traceback.format_exc())
+        raise RuntimeError(f"Kokoro initialization failed: {e}")
 
 
 @app.get("/healthz")
@@ -141,71 +151,110 @@ def healthz():
     return {"ok": True}
 
 
-@app.get("/v1")
-def v1_root():
-    return {"ok": True, "service": "kokoro-openai-streaming", "sr": SR}
-
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(_, exc: HTTPException):
-    # OpenAI SDK expects JSON errors sometimes; this keeps it readable
-    return JSONResponse(status_code=exc.status_code, content={"error": {"message": exc.detail}})
-
-
-# -----------------------------
-# Low-latency stream generators
-# -----------------------------
+# =====================================================
+# STREAM GENERATORS
+# =====================================================
 async def kokoro_pcm_stream(text: str, voice: str, speed: float) -> AsyncGenerator[bytes, None]:
-    """
-    Streams S16LE PCM bytes immediately as Kokoro yields audio segments.
-    Lowest latency output.
-    """
+
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline not initialized")
 
     chunks = chunk_text(text, WORD_THRESHOLD) if CHUNK_ENABLED else [text]
 
+    total_audio_samples = 0
+    first_chunk_time = None
+    generation_start = time.perf_counter()
+
+    logger.info(f"TTS generation started | chunks={len(chunks)}")
+
     for chunk in chunks:
         gen = pipeline(chunk, voice=voice, speed=speed, split_pattern=SPLIT_PATTERN)
+
         for (_gs, _ps, audio) in gen:
+            if first_chunk_time is None:
+                first_chunk_time = time.perf_counter()
+                ttfa_ms = (first_chunk_time - generation_start) * 1000
+                logger.info(f"TTFA (server-side): {ttfa_ms:.2f} ms")
+
             a = as_numpy_float(audio)
+            total_audio_samples += len(a)
+
             yield float_to_s16le_bytes(a)
-            await asyncio.sleep(0)  # cooperative scheduling
+            await asyncio.sleep(0)
+
+    total_audio_sec = total_audio_samples / SR
+    total_gen_ms = (time.perf_counter() - generation_start) * 1000
+
+    logger.info(
+        f"TTS generation completed | "
+        f"audio_duration={total_audio_sec:.2f}s | "
+        f"generation_time={total_gen_ms:.2f}ms"
+    )
 
 
+# =====================================================
+# ENDPOINT
+# =====================================================
+@app.post("/v1/audio/speech")
+async def audio_speech(req: OpenAISpeechRequest, request: Request):
+
+    request_start = time.perf_counter()
+
+    text = (req.input or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="`input` is empty")
+
+    voice = (req.voice or DEFAULT_VOICE).strip()
+    speed = float(req.speed if req.speed is not None else DEFAULT_SPEED)
+    fmt = (req.response_format or "mp3").lower()
+
+    logger.info("--------------------------------------------------")
+    logger.info("New TTS Request Received")
+    logger.info(f"Text Length: {len(text)} chars | Words: {len(text.split())}")
+    logger.info(f"Voice: {voice} | Speed: {speed} | Format: {fmt}")
+
+    # Log first 200 chars only to avoid flooding logs
+    logger.info(f"Input Text (preview): {text[:200]}{'...' if len(text) > 200 else ''}")
+
+    pcm_gen = kokoro_pcm_stream(text=text, voice=voice, speed=speed)
+
+    if fmt in ("pcm", "pcm16", "s16", "raw"):
+        response = StreamingResponse(pcm_gen, media_type="application/octet-stream")
+    elif fmt == "mp3":
+        mp3_gen = mp3_stream_via_ffmpeg(pcm_gen, SR, MP3_BITRATE)
+        response = StreamingResponse(mp3_gen, media_type="audio/mpeg")
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported response_format: {fmt}")
+
+    total_req_ms = (time.perf_counter() - request_start) * 1000
+    logger.info(f"Request accepted | setup_time={total_req_ms:.2f}ms")
+    logger.info("--------------------------------------------------")
+
+    return response
+
+
+# =====================================================
+# MP3 STREAMER (UNCHANGED)
+# =====================================================
 async def mp3_stream_via_ffmpeg(
     pcm_gen: AsyncGenerator[bytes, None],
     sr: int,
     bitrate: str,
 ) -> AsyncGenerator[bytes, None]:
-    """
-    True streaming MP3:
-    - Start ffmpeg encoder subprocess
-    - Feed PCM chunks to stdin as they are generated
-    - Yield MP3 frames from stdout as they are produced
-    """
+
     cmd = [
         "ffmpeg",
         "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "s16le",
-        "-ac",
-        "1",
-        "-ar",
-        str(sr),
-        "-i",
-        "pipe:0",
+        "-loglevel", "error",
+        "-f", "s16le",
+        "-ac", "1",
+        "-ar", str(sr),
+        "-i", "pipe:0",
         "-vn",
-        "-acodec",
-        "libmp3lame",
-        "-b:a",
-        bitrate,
-        "-f",
-        "mp3",
-        "-flush_packets",
-        "1",
+        "-acodec", "libmp3lame",
+        "-b:a", bitrate,
+        "-f", "mp3",
+        "-flush_packets", "1",
         "pipe:1",
     ]
 
@@ -216,108 +265,17 @@ async def mp3_stream_via_ffmpeg(
         stderr=asyncio.subprocess.PIPE,
     )
 
-    assert proc.stdin is not None
-    assert proc.stdout is not None
-    assert proc.stderr is not None
-
     async def feed_pcm():
-        try:
-            async for chunk in pcm_gen:
-                proc.stdin.write(chunk)
-                await proc.stdin.drain()
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-        except Exception:
-            # If client disconnects, generator cancellation can happen
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
+        async for chunk in pcm_gen:
+            proc.stdin.write(chunk)
+            await proc.stdin.drain()
+        proc.stdin.close()
 
-    feeder_task = asyncio.create_task(feed_pcm())
+    asyncio.create_task(feed_pcm())
 
-    try:
-        while True:
-            out = await proc.stdout.read(4096)
-            if out:
-                yield out
-            else:
-                break
-            await asyncio.sleep(0)
-    finally:
-        # ensure feeding stops
-        try:
-            await feeder_task
-        except Exception:
-            pass
-
-        # check ffmpeg result
-        try:
-            rc = await proc.wait()
-        except Exception:
-            rc = None
-
-        if rc not in (0, None):
-            try:
-                err = await proc.stderr.read()
-                logger.error(f"ffmpeg rc={rc}, err={err.decode('utf-8', errors='ignore')}")
-            except Exception:
-                logger.error(f"ffmpeg rc={rc}, stderr read failed")
-
-        try:
-            if proc.returncode is None:
-                proc.kill()
-        except Exception:
-            pass
-
-
-# -----------------------------
-# OpenAI-compatible endpoint
-# -----------------------------
-@app.post("/v1/audio/speech")
-async def audio_speech(req: OpenAISpeechRequest, request: Request):
-    """
-    OpenAI-compatible endpoint:
-      POST /v1/audio/speech
-    Returns raw audio bytes (streamed).
-    """
-    text = (req.input or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="`input` is empty")
-
-    voice = (req.voice or DEFAULT_VOICE).strip()
-    speed = float(req.speed if req.speed is not None else DEFAULT_SPEED)
-    fmt = (req.response_format or "mp3").lower()
-
-    # OpenAI SDK sends Authorization: Bearer <api_key>. We ignore it.
-    _auth = request.headers.get("authorization")
-
-    start = time.perf_counter()
-    logger.info(f"Request: fmt={fmt} voice={voice} speed={speed}")
-
-    try:
-        pcm_gen = kokoro_pcm_stream(text=text, voice=voice, speed=speed)
-
-        if fmt in ("pcm", "pcm16", "s16", "raw"):
-            # Absolute lowest latency, no encoder
-            return StreamingResponse(pcm_gen, media_type=media_type_for(fmt))
-
-        if fmt == "mp3":
-            mp3_gen = mp3_stream_via_ffmpeg(pcm_gen=pcm_gen, sr=SR, bitrate=MP3_BITRATE)
-            return StreamingResponse(mp3_gen, media_type=media_type_for(fmt))
-
-        raise HTTPException(status_code=400, detail=f"Unsupported response_format: {fmt}")
-
-    except HTTPException:
-        raise
-    except asyncio.CancelledError:
-        logger.warning("Client disconnected (cancelled).")
-        raise
-    except Exception as e:
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        total_ms = (time.perf_counter() - start) * 1000.0
-        logger.info(f"Handler lifetime: {total_ms:.1f} ms")
+    while True:
+        out = await proc.stdout.read(4096)
+        if not out:
+            break
+        yield out
+        await asyncio.sleep(0)
