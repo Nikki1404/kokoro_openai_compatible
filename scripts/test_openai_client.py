@@ -1,15 +1,15 @@
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8080/v1",
-    api_key="not-needed",
+    base_url="http://localhost:8082/v1",
+    api_key="not-needed",   # ignored by your server
 )
 
 with client.audio.speech.with_streaming_response.create(
-    model="kokoro",
-    voice="af_heart",
-    input="Hello world from Kokoro, true streaming mp3!",
-    response_format="mp3",
+    model="kokoro",                 # or "tts-1" (ignored by server)
+    voice="af_sky",                 # or "af_heart"
+    input="Hello world from Kokoro!",
+    response_format="mp3",          # "mp3" or "pcm"
 ) as resp:
     resp.stream_to_file("output.mp3")
 
